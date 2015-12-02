@@ -1,0 +1,146 @@
+# This file is maintained by chef - LOCAL CHANGES WILL BE LOST
+#
+# This project's chef repo is at: git@trac.omniti.net:/expeditions/chef
+#  Use the project chef repo to set attributes which affect
+#  the rendering of this template.
+#
+# This template is from the omniti-common chef repo, at 
+#   src@src.omniti.com:~internal/chef/common
+#   in the file cookbooks/s3_backup/templates/default/backup.sh.erb
+
+#!/usr/bin/env bash
+
+set -e
+set -x
+
+## CONFIG ##
+
+HOSTNAME=`hostname`
+BACKUPCONF="/export/home/postgres/etc/pg_dump_backup.conf"
+LOCKFILEPATH="/var/tmp"
+LOCKFILE="${LOCKFILEPATH}/pg_dump_backup-${HOSTNAME}.lock"
+PG_DUMP_CMD="/opt/pgsql/bin/pg_dump"
+EXCLUDE_SCHEMA="null"
+LOG_EXT=".log"
+DUMP_EXT=".dump"
+PGPORT="5432"
+GPG_PATH="/opt/omni/bin/gpg"
+S3_upload_dbname="<%= @backup_db %>"
+BACKUPPATH="/data/set/${HOSTNAME}/postgres/backups/"
+start_time=$(date +"%m_%d_%Y__%H:%M:%S")
+backup_filename="${S3_upload_dbname}_${start_time}${DUMP_EXT}"
+encrypted_file="${backup_filename}.gpg"
+S3_BUCKET="<%= @s3_bucket_link %>"
+gpg_key_name="<%= @gpg_key_name %>"
+S3_CMD_PATH="/opt/python26/bin/s3cmd"
+
+## END CONFIG ##
+
+usage() {
+    cat <<EOF
+$0: [-p <port_number>] [-c <conf_file>]
+        -p <port>               port which database runs on (default 5432)
+        -c <conf_file>          use alternate config file path
+EOF
+
+    rm ${LOCKFILE}
+}
+
+read_params() {
+    while getopts 'p:c:' opt "$@"
+    do
+        case "$opt" in
+            p)
+                PGPORT="${OPTARG}"
+                ;;
+            c)
+                BACKUPCONF="${OPTARG}"
+                ;;
+            h)
+                usage
+                exit 2
+                ;;
+            :)
+                echo "Option -%s requires argument" "$OPTARG"
+                usage
+                exit 2
+                ;;
+            \?)
+                if [[ "$OPTARG" == "?" ]]
+                then
+                    usage
+                    exit 2
+                fi
+                echo "Unknown option -%s" "$OPTARG"
+                usage
+                exit 2
+                ;;
+        esac
+    done
+}
+
+trim() {
+    local var=$@
+    var="${var#"${var%%[![:space:]]*}"}"   # remove leading whitespace characters
+    var="${var%"${var##*[![:space:]]}"}"   # remove trailing whitespace characters
+    echo -n "$var"
+}
+
+sanity_check() {
+  
+    if [ ! -f $LOCKFILE ]; then
+    touch ${LOCKFILE}
+    else
+    echo "Lockfile $LOCKFILE exists, a backup is already in progress!"
+    fi
+}
+
+backup() {
+    
+    while read -r db
+    do
+        [[ ${db} = \#* ]] && continue
+        IFS='|' read -a arr <<< "${db}"
+        dbname="${arr[0]}"
+        arr[0]=" "
+        mkdir -p ${BACKUPPATH}${dbname}
+        LOG_FILE="${BACKUPPATH}${dbname}/${dbname}_${start_time}${LOG_EXT}"
+        echo "Backup in progress" > ${LOG_FILE}
+        if [ ${#arr[@]} -gt 1 ]; then
+        DUMPSTR="${PG_DUMP_CMD} -v -Fc -f ${BACKUPPATH}${dbname}/${dbname}_${start_time}${DUMP_EXT}"
+        for i in "${arr[@]}"
+        do
+        DUMPSTR="${DUMPSTR} ${i}"
+        done
+        ${DUMPSTR} ${dbname} 2>> "${LOG_FILE}"
+        else
+        ${PG_DUMP_CMD} -v -Fc -f ${BACKUPPATH}${dbname}/${dbname}_${start_time}${DUMP_EXT} ${dbname} 2>> "${LOG_FILE}"
+        fi
+        end_time=$(date +"%m_%d_%Y__%H:%M:%S")
+        echo "Backup completed at ${end_time}" >> "${LOG_FILE}"
+    done < "${BACKUPCONF}"
+}
+
+# Encrypt the latest backup file with postgres gpg key
+S3_encrypt() {
+$GPG_PATH -r ${gpg_key_name} --output ${BACKUPPATH}${S3_upload_dbname}/${encrypted_file} --encrypt ${BACKUPPATH}${S3_upload_dbname}/${backup_filename}
+}
+
+# Upload this encrypted file with s3cmd
+S3_upload() {
+$S3_CMD_PATH put ${BACKUPPATH}${S3_upload_dbname}/${encrypted_file} ${S3_BUCKET}${encrypted_file}
+}
+
+# Remove the .gpg file in local directory now that it is stored on S3.
+S3_cleanup() {
+rm ${BACKUPPATH}${S3_upload_dbname}/${encrypted_file}
+}
+
+read_params "$@"
+sanity_check
+backup
+S3_encrypt
+S3_upload
+S3_cleanup
+
+rm ${LOCKFILE}
